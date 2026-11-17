@@ -13,3 +13,120 @@ library(rvest)
 library(httr2)
 library(purrr)
 ```
+
+```{r}
+#| cache: true
+
+years <- c(2015, 2017, 2019, 2021, 2022)
+
+urls <- c(
+  "https://web.archive.org/web/20150101/https://www.imdb.com/chart/top/",
+  "https://web.archive.org/web/20170101/https://www.imdb.com/chart/top/",
+  "https://web.archive.org/web/20190101/https://www.imdb.com/chart/top/",
+  "https://web.archive.org/web/20210101/https://www.imdb.com/chart/top/",
+  "https://web.archive.org/web/20220201012049/https://www.imdb.com/chart/top/"
+)
+
+# Fetch one Wayback IMDb Top 250 page and return a tidy 250-row tibble
+scrape_snapshot <- \(url, snap_year) {
+  page <- request(url) |>
+    req_timeout(90) |>
+    req_retry(max_tries = 3) |>
+    req_perform() |>
+    resp_body_html()
+
+  # Pull vote counts from rating tooltips ("9.2 based on 1,354,030 votes")
+  votes <- page |>
+    html_elements("td.ratingColumn.imdbRating strong") |>
+    html_attr("title") |>
+    str_remove(".*based on ") |>
+    parse_number()
+
+  page |>
+    html_element("table") |>
+    html_table() |>
+    select(`Rank & Title`, rating = `IMDb Rating`) |>
+    # Split "1.\n    The Shawshank Redemption\n    (1994)" into rank, title, year
+    separate_wider_regex(
+      `Rank & Title`,
+      patterns = c(
+        "^\\s*",
+        rank = "\\d+",
+        "\\.\\s+",
+        title = ".*",
+        "\\s+\\(",
+        year = "\\d{4}",
+        "\\)\\s*$"
+      )
+    ) |>
+    mutate(
+      snap_year = snap_year,
+      rank = as.integer(rank),
+      year = as.integer(year),
+      number = votes
+    ) |>
+    select(snap_year, rank, title, year, rating, number)
+}
+
+# Scrape all five snapshots in parallel pairs and stack into one tibble
+imdb_snapshots <- map2(urls, years, scrape_snapshot) |>
+  list_rbind()
+```
+
+```{r}
+rank_changes <- imdb_snapshots |>
+  filter(snap_year %in% c(2015, 2022)) |>
+  select(title, year, snap_year, rank) |>
+  # Put 2015 and 2022 ranks in separate columns for each film
+  pivot_wider(names_from = snap_year, values_from = rank, names_prefix = "rank_") |>
+  # Keep only films present in both snapshots
+  drop_na(rank_2015, rank_2022) |>
+  # Positive = moved up toward #1; negative = dropped in rank
+  mutate(rank_change = rank_2015 - rank_2022)
+
+rank_changes |>
+  arrange(desc(abs(rank_change))) |>
+  slice_head(n = 10)
+```
+
+```{r}
+rank_changes <- rank_changes |>
+  # Floor release year to its decade (e.g., 1994 -> 1990)
+  mutate(decade = (year %/% 10) * 10)
+
+rank_changes |>
+  summarize(avg_rank_change = mean(rank_change), .by = decade) |>
+  arrange(decade)
+```
+
+```{r}
+imdb_snapshots |>
+  # Count appearances per film (include year since remakes can share a title)
+  count(title, year, name = "n_snapshots") |>
+  # Distribution of how many snapshots films appear in
+  count(n_snapshots, name = "n_films")
+```
+
+```{r}
+rank_changes |>
+  summarize(avg_rank_change = mean(rank_change), .by = decade) |>
+  arrange(decade) |>
+  mutate(
+    decade_label = factor(paste0(decade, "s"), levels = paste0(decade, "s")),
+    direction = if_else(avg_rank_change > 0, "Rose", "Fell")
+  ) |>
+  ggplot(aes(x = avg_rank_change, y = decade_label, fill = direction)) +
+  geom_col() +
+  # Vertical reference line marking zero net rank change
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray30") +
+  scale_fill_manual(values = c("Rose" = "#1b9e77", "Fell" = "#d95f02")) +
+  labs(
+    title = "Older Classics Lost Ground in the IMDb Top 250 (2015–2022)",
+    subtitle = "Average change in rank by release decade; only 1990s films gained spots on average",
+    x = "Average Rank Change (Spots Moved Toward #1)",
+    y = "Release Decade",
+    fill = "Rank Direction",
+    caption = "Source: IMDb Top 250 via Wayback Machine (190 films appear in both the 2015 and 2022 snapshots)."
+  ) +
+  theme_minimal()
+```
